@@ -17,12 +17,12 @@ NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
 
 
 @pytest.mark.parametrize("campaign,generation,predecessor,installed_definition", [
-    ("catalog-fast-canary-v1", 3,
-     "7f7592487ff5c846d3c1dd0c89f2ff8232b384e053838a227a15901cca812d83",
-     "2911eba05f40dff8a4e4e6f20424a846213dd8d1a97a548f12a2248cba590f76"),
+    ("catalog-fast-canary-v1", 4,
+     "b253c84105c6c221d1b8e2068cd5951c03cd564eaf9699d3fb5a841fa48eb37e",
+     "fd0d9904b66458be9bd1ecfea5a8224f85669def9beaf379c7450d475cb26ace"),
     ("sp500-optimized-catalog-v1", 7,
      "1f73eadbb2404095072c61fb67f36f813cff8b119bc17bbb3d5df8852ad333f7",
-     "4a98ce3a732c66a130ac2e28f7c6dabc15c21f22ebb6df23d67485ec8ac14eea"),
+     "684f349ba2e97f1f6fe03a78c7649f44baf22111691c11cc92909102cd7e0334"),
 ])
 def test_release_transition_resolves_installed_unused_ticket_to_packaged_definition(
     campaign, generation, predecessor, installed_definition,

@@ -135,9 +135,9 @@ runs:
         root = Path(os.environ["SEALED_PLAN_PATH"]).resolve(strict=True)
         artifacts = set()
         for name in (
-            "recipe_worker_matrix_a.json",
-            "recipe_worker_matrix_b.json",
-            "recipe_worker_matrix_c.json",
+            "recipe_matrix_a.json",
+            "recipe_matrix_b.json",
+            "recipe_matrix_c.json",
         ):
             payload = json.loads((root / name).read_text("utf-8"))
             include = payload.get("include")
@@ -267,9 +267,9 @@ runs:
 
         original_rows = []
         for name in (
-            "recipe_worker_matrix_a.json",
-            "recipe_worker_matrix_b.json",
-            "recipe_worker_matrix_c.json",
+            "recipe_matrix_a.json",
+            "recipe_matrix_b.json",
+            "recipe_matrix_c.json",
         ):
             original_rows.extend(
                 json.loads((plan_root / name).read_text("utf-8"))["include"]

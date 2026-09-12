@@ -1,7 +1,7 @@
 {
   "schema_version": "catalog-fast-canary-recovery-policy-v1",
   "campaign_key": "catalog-fast-canary-v1",
-  "controlled_generation": 4,
+  "controlled_generation": 5,
   "expected_worker_count": 4,
   "target_worker_id": 3,
   "target_checkpoint_slot_index": 1,
