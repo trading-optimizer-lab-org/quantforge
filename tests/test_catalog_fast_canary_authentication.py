@@ -21,7 +21,7 @@ from aurora.infra.sp500_megarun.catalog_request_contract import (
 )
 
 
-def sign_canary_request(private, *, definition_sha256="c" * 64, generation=4):
+def sign_canary_request(private, *, definition_sha256="c" * 64, generation=5):
     """Ephemeral test signer; never reads or changes any installed credential."""
     ticket = CatalogLaunchTicketV1(
         schema_version="1", request_id="018f47a2-6e91-7c34-8000-000000000003",
@@ -49,7 +49,7 @@ def sign_canary_request(private, *, definition_sha256="c" * 64, generation=4):
 
 
 def _public_scope(context_sha256="a" * 64, request_sha256="b" * 64):
-    identity = dict(campaign_key="catalog-fast-canary-v1", generation=4,
+    identity = dict(campaign_key="catalog-fast-canary-v1", generation=5,
                     context_sha256=context_sha256, request_sha256=request_sha256,
                     execution_plan_sha256="c" * 64)
     return dict(**identity, enabled="true", acceptance_token=canary.build_canary_acceptance_token(**identity),
@@ -74,12 +74,12 @@ def test_signed_request_cannot_be_replaced_by_rehashed_cli_fields(tmp_path, monk
     monkeypatch.setattr(canary, "_PUBLIC_KEY_PATH", public_path)
     monkeypatch.setenv("GITHUB_SHA", "e" * 40)
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
-    request = sign_canary_request(private, generation=3 if mutation == "generation" else 4)
+    request = sign_canary_request(private, generation=4 if mutation == "generation" else 5)
     payload = request.model_dump(mode="json")
     if mutation == "signature":
         payload["requester_attestation_b64"] = b64encode(bytes(256)).decode("ascii")
     if mutation == "generation":
-        payload["launch_generation"] = 4
+        payload["launch_generation"] = 5
     request_hash = CatalogRunRequestV1.model_validate(payload).request_sha256
     context = dict(schema_version="1", document_type="catalog_fast_request_context_v1",
                    request_mode="admit_new", issue_number=300, request=payload,
@@ -122,7 +122,7 @@ def test_nonselected_workers_do_not_read_canary_files(tmp_path):
     assert canary.should_inject_canary_failure(**scope) is False
 
 
-@pytest.mark.parametrize("generation", (2, 3, 4, 5))
+@pytest.mark.parametrize("generation", (2, 3, 4, 5, 6))
 def test_actual_workflow_bootstrap_needs_only_stdlib(tmp_path, generation):
     root = Path(__file__).resolve().parents[1]
     workflow = yaml.safe_load((root / ".github/workflows/catalog-optimized-run.yml").read_text("utf-8"))
@@ -148,10 +148,10 @@ def test_actual_workflow_bootstrap_needs_only_stdlib(tmp_path, generation):
                             env=environment, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     values = dict(line.split("=", 1) for line in output.read_text("utf-8").splitlines())
-    assert values["fault_enabled"] == ("true" if generation == 4 else "false")
-    if generation == 4:
+    assert values["fault_enabled"] == ("true" if generation == 5 else "false")
+    if generation == 5:
         assert values["acceptance_token"] == canary.build_canary_acceptance_token(
-            campaign_key="catalog-fast-canary-v1", generation=4,
+            campaign_key="catalog-fast-canary-v1", generation=5,
             context_sha256=context["content_sha256"], request_sha256=request.request_sha256,
             execution_plan_sha256="c" * 64,
         )
