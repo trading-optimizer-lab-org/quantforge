@@ -202,7 +202,8 @@ env:
   AURORA_AUTONOMOUS_BATCH_ID: ${{ inputs.autonomous_batch_id }}
   AURORA_AUTONOMOUS_CANDIDATE_COUNT: ${{ inputs.autonomous_candidate_count }}
   AURORA_AUTONOMOUS_PREVIOUS_TRIAL_COUNT: ${{ inputs.autonomous_previous_trial_count }}
-  AURORA_PREPARED_ARTIFACT_NAME: ${{ inputs.prepared_artifact_name || format('{0}-prepared-{1}-{2}', inputs.run_label, github.run_id, github.run_attempt) }}
+  AURORA_PREPARED_ARTIFACT_NAME: ${{ inputs.prepared_artifact_name != '' && contains(inputs.workload, 'sp500_autonomous_discovery') && format('{0}-refreshed-prepared-{1}-{2}', inputs.run_label, github.run_id, github.run_attempt) || inputs.prepared_artifact_name || format('{0}-prepared-{1}-{2}', inputs.run_label, github.run_id, github.run_attempt) }}
+  AURORA_PREPARED_ARTIFACT_RUN_ID: ${{ inputs.prepared_artifact_name != '' && contains(inputs.workload, 'sp500_autonomous_discovery') && github.run_id || inputs.prepared_artifact_run_id || github.run_id }}
   AURORA_WHEELHOUSE_ARTIFACT_NAME: ${{ inputs.wheelhouse_artifact_name || format('{0}-wheelhouse-{1}-{2}', inputs.run_label, github.run_id, github.run_attempt) }}
 
 jobs:
@@ -478,6 +479,21 @@ jobs:
         with:
           pattern: ${{ inputs.run_label }}-stooq-${{ github.run_id }}-*
           path: ${{ runner.temp }}/stooq-windows
+      - name: Download canonical V1 and V2 multiplicity evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: sp500-ls-v2-train-results
+          path: ${{ runner.temp }}/historical-multiplicity
+          github-token: ${{ github.token }}
+          run-id: "31007105419"
+      - name: Download canonical autonomous pilot evidence
+        if: inputs.autonomous_previous_trial_count > 312
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: sp500-auto-pilot-b0-results
+          path: ${{ runner.temp }}/autonomous-pilot
+          github-token: ${{ github.token }}
+          run-id: "31036879593"
       - name: Merge and verify Stooq windows
         run: |
           set -euo pipefail
@@ -494,6 +510,8 @@ jobs:
           SPEC_PATH: ${{ inputs.spec_path }}
           WORKLOAD: ${{ inputs.workload }}
           AURORA_PRIOR_TRIAL_LEDGER_PATH: ${{ runner.temp }}/prior-ledger/trial_ledger.jsonl
+          AURORA_HISTORICAL_MULTIPLICITY_SOURCE: ${{ runner.temp }}/historical-multiplicity
+          AURORA_AUTONOMOUS_PILOT_EVIDENCE_ROOT: ${{ runner.temp }}/autonomous-pilot
         run: |
           set -euo pipefail
           aurora github prepare \
@@ -527,10 +545,11 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download immutable wheelhouse
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: ./.github/actions/download-artifact-retry
         with:
-          name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
-          path: ${{ runner.temp }}/wheelhouse
+          artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
+          output-dir: ${{ runner.temp }}/wheelhouse
+          attempts: "6"
       - name: Restore Aurora runtime
         uses: ./.github/actions/aurora-runtime-setup
         with:
@@ -549,10 +568,27 @@ jobs:
         if: inputs.prepared_artifact_name != '' || needs.sp500_data_plan.outputs.enabled == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
+          name: ${{ inputs.prepared_artifact_name || env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
           run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+      - name: Refresh autonomous batch inputs on reused market data
+        if: inputs.prepared_artifact_name != '' && contains(inputs.workload, 'sp500_autonomous_discovery')
+        env:
+          AURORA_PRIOR_TRIAL_LEDGER_PATH: ${{ runner.temp }}/prior-ledger/trial_ledger.jsonl
+        run: |
+          set -euo pipefail
+          python scripts/refresh_sp500_autonomous_prepared.py \
+            --prepared-root "$RUNNER_TEMP/prepared"
+      - name: Upload refreshed autonomous prepared inputs
+        if: inputs.prepared_artifact_name != '' && contains(inputs.workload, 'sp500_autonomous_discovery')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/prepared
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
       - name: Prepare immutable data once
         if: inputs.prepared_artifact_name == '' && needs.sp500_data_plan.outputs.enabled != 'true'
         env:
@@ -612,7 +648,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Freeze resolved scientific and performance contract
         env:
           SPEC_PATH: ${{ inputs.spec_path }}
@@ -676,7 +712,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Run bounded smoke
         env:
           WORKLOAD: ${{ inputs.workload }}
@@ -729,7 +765,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download prior immutable performance profile
         if: >-
           inputs.performance_profile_run_id != '' &&
@@ -827,7 +863,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download pilot evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -958,7 +994,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download assignment plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -1092,7 +1128,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download assignment plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -1340,7 +1376,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download assignment plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -1489,7 +1525,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download assignment plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -1657,7 +1693,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1689,7 +1725,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1753,7 +1789,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1785,7 +1821,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1849,7 +1885,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1881,7 +1917,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1945,7 +1981,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -1977,7 +2013,7 @@ jobs:
           retention-days: ${{ inputs.retention_days }}
           wheelhouse-artifact-name: ${{ env.AURORA_WHEELHOUSE_ARTIFACT_NAME }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -2051,7 +2087,7 @@ jobs:
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
 
   merge_level_1:
     needs: [plan, merge_level_0]
@@ -2084,7 +2120,7 @@ jobs:
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
 
   merge_level_2:
     needs: [plan, merge_level_1]
@@ -2117,7 +2153,7 @@ jobs:
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
 
   merge_level_3:
     needs: [plan, merge_level_2]
@@ -2150,7 +2186,7 @@ jobs:
           contract-artifact-name: ${{ inputs.run_label }}-contract-${{ github.run_id }}-${{ github.run_attempt }}
           plan-artifact-name: ${{ inputs.run_label }}-plan-${{ github.run_id }}-${{ github.run_attempt }}
           prepared-artifact-name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
-          prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
 
   final_merge:
     needs: [plan, freeze_contract, merge_level_0, merge_level_1, merge_level_2, merge_level_3]
@@ -2214,7 +2250,7 @@ jobs:
           name: ${{ env.AURORA_PREPARED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/prepared
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.prepared_artifact_run_id || github.run_id }}
+          run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}
       - name: Download merge root only
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:

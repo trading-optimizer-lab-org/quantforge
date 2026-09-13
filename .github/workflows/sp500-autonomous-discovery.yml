@@ -18,6 +18,7 @@ on:
           - statistical_gate
           - freeze
           - validation_once
+          - exploratory_validation
           - verify
       batch_id:
         description: Deterministic autonomous batch identifier
@@ -74,6 +75,16 @@ on:
         type: string
       train_prepared_artifact:
         description: Frozen train prepared-input artifact
+        required: false
+        default: ""
+        type: string
+      exploratory_strategy_id:
+        description: Exact train candidate for owner-authorized exploratory validation
+        required: false
+        default: ""
+        type: string
+      validation_stooq_run_id:
+        description: Prior verified run containing bounded validation Stooq windows
         required: false
         default: ""
         type: string
@@ -223,7 +234,7 @@ jobs:
           retention-days: 90
 
   train_batch:
-    if: inputs.phase == 'search_batch'
+    if: inputs.phase == 'search_batch' && inputs.batch_id != 1000
     uses: ./.github/workflows/_aurora-future-run-v3.yml
     with:
       spec_path: config/sp500_autonomous_discovery.yaml
@@ -241,7 +252,7 @@ jobs:
 
   continue_or_freeze:
     needs: train_batch
-    if: inputs.phase == 'search_batch' && needs.train_batch.result == 'success'
+    if: inputs.phase == 'search_batch' && inputs.batch_id != 1000 && needs.train_batch.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -321,6 +332,241 @@ jobs:
           path: ${{ runner.temp }}/next_inputs.json
           if-no-files-found: error
           retention-days: 90
+
+  massive_prepare:
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact massive-search revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: ""
+      - name: Download verified batch 51 inputs, results, and wheelhouse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 31181579135 --repo "$GITHUB_REPOSITORY" \
+            --name "sp500-auto-batch-51-refreshed-prepared-31181579135-1" \
+            --dir "$RUNNER_TEMP/source-prepared"
+          gh run download 31181579135 --repo "$GITHUB_REPOSITORY" \
+            --name "sp500-auto-batch-51-results" \
+            --dir "$RUNNER_TEMP/prior-results"
+          gh run download 31181579135 --repo "$GITHUB_REPOSITORY" \
+            --name "sp500-auto-batch-51-wheelhouse-31181579135-1" \
+            --dir "$RUNNER_TEMP/wheelhouse"
+      - name: Build one relocatable locked runtime
+        run: |
+          set -euo pipefail
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-index \
+            --find-links "$RUNNER_TEMP/wheelhouse" \
+            --require-hashes \
+            --target "$RUNNER_TEMP/runtime-site" \
+            -r requirements/github-performance.lock
+      - name: Prepare compact train input and prior multiplicity evidence
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/..:$RUNNER_TEMP/runtime-site"
+          python scripts/prepare_sp500_massive_train.py \
+            --source-prepared-root "$RUNNER_TEMP/source-prepared" \
+            --prior-results-root "$RUNNER_TEMP/prior-results" \
+            --prior-output-dir "$RUNNER_TEMP/prior" \
+            --output-dir "$RUNNER_TEMP/input"
+          python scripts/prepare_sp500_massive_prior_statistics.py \
+            --prior-root "$RUNNER_TEMP/prior" \
+            --prepared-root "$RUNNER_TEMP/input" \
+            --output-dir "$RUNNER_TEMP/prior/statistics" \
+            --workers 4
+      - name: Upload compact runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sp500-massive-runtime-${{ github.run_id }}
+          path: ${{ runner.temp }}/runtime-site
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload compact train-only input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sp500-massive-train-inputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/input
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload prior multiplicity accumulators
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sp500-massive-prior-${{ github.run_id }}
+          path: ${{ runner.temp }}/prior
+          if-no-files-found: error
+          retention-days: 7
+
+  massive_wave_0:
+    needs: massive_prepare
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_prepare.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 0
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_1:
+    needs: massive_wave_0
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_0.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 1
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_2:
+    needs: massive_wave_1
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_1.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 2
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_3:
+    needs: massive_wave_2
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_2.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 3
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_4:
+    needs: massive_wave_3
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_3.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 4
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_5:
+    needs: massive_wave_4
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_4.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 5
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_wave_6:
+    needs: massive_wave_5
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_5.result == 'success'
+    uses: ./.github/workflows/_sp500-massive-train-wave.yml
+    with:
+      wave: 6
+      input_artifact_name: sp500-massive-train-inputs-${{ github.run_id }}
+      runtime_artifact_name: sp500-massive-runtime-${{ github.run_id }}
+      minutes_per_shard: 50
+      max_candidates_per_worker: 0
+    secrets: inherit
+
+  massive_final_merge:
+    needs: massive_wave_6
+    if: inputs.phase == 'search_batch' && inputs.batch_id == 1000 && needs.massive_wave_6.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: ""
+      - name: Download runtime, seven waves, and prior multiplicity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "sp500-massive-runtime-$GITHUB_RUN_ID" \
+            --dir "$RUNNER_TEMP/runtime"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "sp500-massive-prior-$GITHUB_RUN_ID" \
+            --dir "$RUNNER_TEMP/all/prior"
+          for wave in $(seq 0 6); do
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "sp500-massive-wave-$wave-results" \
+              --dir "$RUNNER_TEMP/all/wave-$wave"
+          done
+      - name: Merge and apply frozen train gates
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/..:$RUNNER_TEMP/runtime"
+          python scripts/merge_sp500_massive_train.py \
+            --mode final \
+            --input-root "$RUNNER_TEMP/all" \
+            --prior-root "$RUNNER_TEMP/all/prior" \
+            --output-dir "$RUNNER_TEMP/final" \
+            --retain-top 50000
+      - name: Verify no validation or locked access
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          summary = json.loads((Path(os.environ["RUNNER_TEMP"]) / "final" / "summary.json").read_text())
+          assert summary["train_end"] == "2010-12-31"
+          assert summary["validation_opened"] is False
+          assert summary["locked_start"] == "2021-01-01"
+          assert summary["locked_opened"] is False
+          assert summary["github_only"] is True
+          assert summary["requires_local_machine"] is False
+          PY
+      - name: Upload final train-only result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sp500-massive-train-night-results
+          path: ${{ runner.temp }}/final
+          if-no-files-found: error
+          retention-days: 90
+      - name: Delete consumed massive-search artifacts
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name != "sp500-massive-train-night-results" and (.name | startswith("sp500-massive-"))) | .id' |
+          while read -r artifact_id; do
+            [[ -z "$artifact_id" ]] || gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+          done
 
   verify_train_artifact:
     if: contains(fromJSON('["merge_batch","statistical_gate","freeze","verify"]'), inputs.phase)
@@ -402,6 +648,7 @@ jobs:
           path: ${{ runner.temp }}/validation-reservation/reservation.json
           if-no-files-found: error
           retention-days: 90
+
       - name: Verify one-shot authorization
         env:
           VALIDATION_ACK: ${{ inputs.validation_ack }}
@@ -436,7 +683,7 @@ jobs:
           prepare_market_snapshot(
               Path(os.environ["RUNNER_TEMP_VALUE"]) / "validation-prepared",
               base_package(),
-              start="2010-01-01",
+              start="2011-01-01",
               end="2020-12-31",
               split="validation",
           )
@@ -475,5 +722,127 @@ jobs:
         with:
           name: sp500-autonomous-validation-once-${{ github.run_id }}
           path: ${{ runner.temp }}/validation-results
+          if-no-files-found: error
+          retention-days: 90
+
+  exploratory_validation:
+    if: inputs.phase == 'exploratory_validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: ""
+      - name: Install locked runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --require-hashes -r requirements/github-performance.lock
+          python -m pip install --no-deps -e .
+      - name: Verify explicit exploratory authorization
+        env:
+          VALIDATION_ACK: ${{ inputs.validation_ack }}
+          TRAIN_RUN_ID: ${{ inputs.train_run_id }}
+          TRAIN_RESULTS_ARTIFACT: ${{ inputs.train_results_artifact }}
+          STRATEGY_ID: ${{ inputs.exploratory_strategy_id }}
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATION_ACK" == "OPEN_EXPLORATORY_VALIDATION_2011_2020_OWNER_AUTHORIZED" ]]
+          [[ "$TRAIN_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ -n "$TRAIN_RESULTS_ARTIFACT" && -n "$STRATEGY_ID" ]]
+      - name: Download exact train result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.train_run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --name "${{ inputs.train_results_artifact }}" --dir "$RUNNER_TEMP/train-results"
+      - name: Download reusable validation Stooq windows
+        if: inputs.validation_stooq_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_STOOQ_RUN_ID: ${{ inputs.validation_stooq_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATION_STOOQ_RUN_ID" =~ ^[0-9]+$ ]]
+          gh run download "$VALIDATION_STOOQ_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern "sp500-ls-stooq-window-${VALIDATION_STOOQ_RUN_ID}-*" \
+            --dir "$RUNNER_TEMP/stooq-windows"
+      - name: Merge reusable validation Stooq windows
+        if: inputs.validation_stooq_run_id != ''
+        run: |
+          set -euo pipefail
+          python scripts/merge_sp500_stooq_windows.py \
+            --input-root "$RUNNER_TEMP/stooq-windows" \
+            --output-dir "$RUNNER_TEMP/stooq-merged" \
+            --expected-windows 82 \
+            --requested-start 2011-01-01 \
+            --requested-end 2020-12-31
+      - name: Prepare bounded validation data
+        env:
+          RUNNER_TEMP_VALUE: ${{ runner.temp }}
+          VALIDATION_STOOQ_RUN_ID: ${{ inputs.validation_stooq_run_id }}
+          STRATEGY_ID: ${{ inputs.exploratory_strategy_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$VALIDATION_STOOQ_RUN_ID" ]]; then
+            export SP500_STOOQ_HISTORY_CSV="$RUNNER_TEMP/stooq-merged/stooq_spy_us_history.csv"
+            export SP500_STOOQ_HISTORY_MANIFEST="$RUNNER_TEMP/stooq-merged/stooq_sharded_manifest.json"
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from aurora.infra.sp500_autonomous_discovery.validation import exploratory_validation_package
+          from aurora.infra.sp500_long_short_daily.data import prepare_market_snapshot
+
+          root = Path(os.environ["RUNNER_TEMP_VALUE"])
+          prepare_market_snapshot(
+              root / "validation-prepared",
+              exploratory_validation_package(root / "train-results", os.environ["STRATEGY_ID"]),
+              start="2011-01-01",
+              end="2020-12-31",
+              split="validation",
+          )
+          PY
+      - name: Evaluate exact candidate without opening locked
+        run: |
+          set -euo pipefail
+          python scripts/run_sp500_autonomous_exploratory_validation.py \
+            --train-results-dir "$RUNNER_TEMP/train-results" \
+            --validation-prepared-dir "$RUNNER_TEMP/validation-prepared" \
+            --output-dir "$RUNNER_TEMP/exploratory-validation-results" \
+            --strategy-id "${{ inputs.exploratory_strategy_id }}" \
+            --validation-ack "${{ inputs.validation_ack }}"
+      - name: Verify validation and locked boundaries
+        env:
+          RUNNER_TEMP_VALUE: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summary = json.loads(
+              (Path(os.environ["RUNNER_TEMP_VALUE"]) / "exploratory-validation-results" / "validation_summary.json")
+              .read_text(encoding="utf-8")
+          )
+          assert summary["validation_end"] == "2020-12-31"
+          assert summary["locked_start"] == "2021-01-01"
+          assert summary["locked_opened"] is False
+          assert summary["confirmatory_result"] is False
+          assert summary["official_validation_reservation_created"] is False
+          PY
+      - name: Upload exploratory validation result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sp500-autonomous-exploratory-validation-${{ inputs.exploratory_strategy_id }}
+          path: ${{ runner.temp }}/exploratory-validation-results
           if-no-files-found: error
           retention-days: 90

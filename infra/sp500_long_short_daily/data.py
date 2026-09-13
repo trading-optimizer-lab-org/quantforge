@@ -45,6 +45,7 @@ STOOQ_HISTORY_PAGE = "https://stooq.com/q/d/"
 STOOQ_VERIFY = "https://stooq.com/__verify"
 FRED_DOWNLOAD = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 FRED_API_OBSERVATIONS = "https://api.stlouisfed.org/fred/series/observations"
+CBOE_VXO_HISTORY = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXO_History.csv"
 SPY_RETURN_TOLERANCE = 5e-4
 SPY_REQUIRED_TOLERANCE_FRACTION = 0.995
 SPY_MEDIAN_ADJUDICATION_MAX_SPREAD = 2.5e-3
@@ -1434,6 +1435,52 @@ def download_alfred_initial_series(
     return frame, receipt
 
 
+def load_cboe_vxo_history(
+    path: Path,
+    start: Any,
+    end: Any,
+    *,
+    split: str,
+) -> tuple[pd.Series, DownloadReceipt]:
+    """Load a phase-bounded official Cboe VXO capture without opening later tiers."""
+
+    start_date, end_date = _bounded_dates(start, end, split=split)
+    source = Path(path).resolve()
+    payload = source.read_bytes()
+    frame = _parse_csv(payload)
+    required_columns = {"DATE", "CLOSE"}
+    if not required_columns.issubset(frame.columns):
+        raise DataGateError("CBOE_VXO_SCHEMA_MISMATCH")
+    frame = _assert_response_date_bound(
+        frame,
+        date_column="DATE",
+        start=start_date,
+        end=end_date,
+        label=f"cboe_vxo_{split}",
+    )
+    values = pd.to_numeric(frame["CLOSE"], errors="coerce")
+    if values.isna().any() or (values <= 0).any():
+        raise DataGateError("CBOE_VXO_INVALID_CLOSE")
+    series = pd.Series(
+        values.to_numpy(dtype=float),
+        index=pd.DatetimeIndex(frame["DATE"]),
+        name="VXO",
+    ).sort_index(kind="mergesort")
+    if series.index.has_duplicates:
+        raise DataGateError("CBOE_VXO_DUPLICATE_DATE")
+    receipt = DownloadReceipt(
+        dataset_id="DS005",
+        url_template=CBOE_VXO_HISTORY,
+        sha256=_sha256(payload),
+        byte_count=len(payload),
+        minimum_date=series.index.min().date().isoformat() if len(series) else None,
+        maximum_date=series.index.max().date().isoformat() if len(series) else None,
+        status="loaded_phase_bounded_official_cboe_history",
+        reason=f"frozen_source_file={source.name}",
+    )
+    return series, receipt
+
+
 def load_state_street_distributions(
     path: Path,
     start: Any,
@@ -1706,6 +1753,10 @@ FRED_DATASETS: Mapping[str, tuple[str, str]] = {
     "DS050": ("DTWEXBGS", "USD"),
     "DS051": ("DCOILWTICO", "WTI"),
     "DS052": ("GOLDAMGBD228NLBM", "GOLD"),
+}
+
+FRED_FIRST_DISSEMINATION: Mapping[str, pd.Timestamp] = {
+    "DS004": pd.Timestamp("2003-09-22"),
 }
 
 
@@ -2146,6 +2197,35 @@ def prepare_market_snapshot(
     for dataset_id, reason in static_rejections.items():
         if dataset_id in required:
             rejected[dataset_id] = reason
+    if "DS005" in required:
+        vxo_filename = (
+            "cboe_vxo_daily_1993_2010.csv"
+            if split == "train"
+            else "cboe_vxo_daily_2011_2020.csv"
+        )
+        vxo_path = Path(
+            os.environ.get("SP500_CBOE_VXO_HISTORY_CSV", "").strip()
+            or _repo_campaign_root() / "official_inputs" / vxo_filename
+        )
+        try:
+            print(f"[sp500-data] cboe DS005 start file={vxo_filename}", flush=True)
+            downloaded, receipt = load_cboe_vxo_history(
+                vxo_path,
+                start_date,
+                end_date,
+                split=split,
+            )
+            aligned = _align_causal(downloaded, ledger.index, lag_sessions=1)
+            if not aligned.notna().any():
+                raise DataGateError("NO_CAUSAL_VALUES_IN_PHASE:DS005")
+            series["VXO"] = aligned
+            receipts.append(receipt)
+            available.add("DS005")
+            _store_raw(raw_root, vxo_path.name, vxo_path.read_bytes())
+            print("[sp500-data] cboe DS005 complete", flush=True)
+        except (DataGateError, OSError) as exc:
+            rejected["DS005"] = str(exc)
+            print(f"[sp500-data] cboe DS005 rejected={exc}", flush=True)
     for dataset_id, (fred_id, logical_name) in FRED_DATASETS.items():
         if dataset_id not in required:
             continue
@@ -2160,7 +2240,7 @@ def prepare_market_snapshot(
                 session=client,
                 raw_dir=raw_root,
             )
-            first_dissemination = pd.Timestamp("2003-09-22") if dataset_id == "DS004" else None
+            first_dissemination = FRED_FIRST_DISSEMINATION.get(dataset_id)
             aligned = _align_initial_releases(
                 downloaded,
                 ledger.index,

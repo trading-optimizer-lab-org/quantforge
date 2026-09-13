@@ -22,14 +22,40 @@ IMPLEMENTED_FAMILIES = frozenset(
         "calendar_seasonality",
         "credit_spread_regime",
         "dual_ma_cross",
+        "dual_reversal_trend_vote",
+        "trend_guarded_dual_reversal",
+        "volatility_regime_reversal",
+        "overnight_tug_reversal_vote",
+        "strong_trend_override_reversal",
+        "asymmetric_trend_override_reversal",
+        "drawdown_recovery_override_reversal",
+        "quiet_bull_recovery_override_reversal",
+        "recovery_trend_breakout_majority",
+        "high_vol_crash_recovery_reversal",
+        "adaptive_recovery_edge_switch",
+        "recovery_overnight_tug_vote",
+        "recovery_turn_month_vote",
+        "recovery_internal_bar_strength_vote",
+        "recovery_multi_horizon_reversal_vote",
+        "recovery_volume_gated_reversal_vote",
+        "recovery_calendar_volume_reversal_vote",
+        "recovery_calendar_volume_vxo_vote",
         "financial_conditions_regime",
         "monetary_inflation_regime",
         "overnight_futures_proxy",
         "price_breakout",
         "price_trend_sma",
+        "internal_bar_strength_reversal",
+        "intraday_return_reversal",
+        "multi_horizon_reversal",
         "realized_volatility_state",
+        "return_threshold_reversal",
+        "reversal_trend_blend",
+        "rsi_reversal",
+        "rsi_trend_blend",
         "short_horizon_reversal",
         "simple_rule_ensemble",
+        "streak_reversal",
         "time_series_momentum",
         "trend_ensemble",
         "variance_risk_premium_proxy",
@@ -190,6 +216,1344 @@ def _price_score(
         lookback = int(parameters["lookback"])
         cached_return = cached(f"return_{lookback}d")
         return -cached_return if cached_return is not None else -(close / close.shift(lookback) - 1.0)
+    if family == "multi_horizon_reversal":
+        horizons = [int(value) for value in parameters["horizons"]]
+        components = [close / close.shift(window) - 1.0 for window in horizons]
+        return -pd.concat(components, axis=1).mean(axis=1, skipna=False)
+    if family == "reversal_trend_blend":
+        reversal_window = int(parameters["reversal_window"])
+        trend_window = int(parameters["trend_window"])
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_return = close / close.shift(reversal_window) - 1.0
+        trend_return = close / close.shift(trend_window) - 1.0
+        return (-reversal_return).where(reversal_return.abs() >= threshold, trend_return)
+    if family == "rsi_trend_blend":
+        window = int(parameters["rsi_window"])
+        trend_window = int(parameters["trend_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / window,
+            adjust=False,
+            min_periods=window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / window,
+            adjust=False,
+            min_periods=window,
+        ).mean()
+        rsi = 100.0 - 100.0 / (1.0 + gain / loss.replace(0.0, np.nan))
+        trend = close / close.shift(trend_window) - 1.0
+        score = trend.copy()
+        score.loc[rsi <= float(parameters["lower"])] = 1.0
+        score.loc[rsi >= float(parameters["upper"])] = -1.0
+        return score.where(rsi.notna() & trend.notna())
+    if family == "dual_reversal_trend_vote":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(rsi > float(parameters["lower"]), 1.0)
+        rsi_component = rsi_component.where(rsi < float(parameters["upper"]), -1.0)
+
+        reversal_return = close / close.shift(int(parameters["reversal_window"])) - 1.0
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < threshold,
+            -np.sign(reversal_return),
+        )
+        score = (
+            float(parameters["rsi_weight"]) * rsi_component
+            + float(parameters["reversal_weight"]) * reversal_component
+        )
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+        )
+    if family == "trend_guarded_dual_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(rsi > float(parameters["lower"]), 1.0)
+        rsi_component = rsi_component.where(rsi < float(parameters["upper"]), -1.0)
+
+        reversal_return = close / close.shift(int(parameters["reversal_window"])) - 1.0
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < threshold,
+            -np.sign(reversal_return),
+        )
+
+        guard_return = close / close.shift(int(parameters["guard_trend_window"])) - 1.0
+        score = (
+            float(parameters["rsi_weight"]) * rsi_component
+            + float(parameters["reversal_weight"]) * reversal_component
+            + float(parameters["guard_weight"]) * np.sign(guard_return)
+        )
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & guard_return.notna()
+        )
+    if family == "volatility_regime_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(rsi > float(parameters["lower"]), 1.0)
+        rsi_component = rsi_component.where(rsi < float(parameters["upper"]), -1.0)
+
+        reversal_return = close / close.shift(int(parameters["reversal_window"])) - 1.0
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < threshold,
+            -np.sign(reversal_return),
+        )
+        normal_score = (
+            float(parameters["rsi_weight"]) * rsi_component
+            + float(parameters["reversal_weight"]) * reversal_component
+        )
+
+        volatility_window = int(parameters["volatility_window"])
+        realized_volatility = log_return.rolling(
+            volatility_window,
+            min_periods=volatility_window,
+        ).std(ddof=1) * np.sqrt(252.0)
+        regime_trend_return = (
+            close / close.shift(int(parameters["regime_trend_window"])) - 1.0
+        )
+        high_volatility = realized_volatility >= (
+            float(parameters["high_volatility_pct"]) / 100.0
+        )
+        score = normal_score.where(~high_volatility, np.sign(regime_trend_return))
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & realized_volatility.notna()
+            & regime_trend_return.notna()
+        )
+    if family == "overnight_tug_reversal_vote":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(rsi > float(parameters["lower"]), 1.0)
+        rsi_component = rsi_component.where(rsi < float(parameters["upper"]), -1.0)
+
+        reversal_return = close / close.shift(int(parameters["reversal_window"])) - 1.0
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < threshold,
+            -np.sign(reversal_return),
+        )
+
+        adjusted_open = ledger["tr_open"].astype(float)
+        overnight = np.log(adjusted_open / close.shift(1))
+        intraday = np.log(close / adjusted_open)
+        tug = (overnight - intraday).rolling(
+            int(parameters["tug_lookback"]),
+            min_periods=int(parameters["tug_lookback"]),
+        ).sum()
+        score = (
+            float(parameters["rsi_weight"]) * rsi_component
+            + float(parameters["reversal_weight"]) * reversal_component
+            + float(parameters["tug_weight"]) * np.sign(tug)
+        )
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & tug.notna()
+        )
+    if family == "strong_trend_override_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(rsi > float(parameters["lower"]), 1.0)
+        rsi_component = rsi_component.where(rsi < float(parameters["upper"]), -1.0)
+
+        reversal_return = close / close.shift(int(parameters["reversal_window"])) - 1.0
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        threshold = float(parameters["reversal_threshold_pct"]) / 100.0
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < threshold,
+            -np.sign(reversal_return),
+        )
+        score = rsi_component + reversal_component
+
+        override_return = close / close.shift(int(parameters["override_window"])) - 1.0
+        override_threshold = float(parameters["override_threshold_pct"]) / 100.0
+        score = score.where(override_return <= override_threshold, 1.0)
+        if str(parameters["override_mode"]) == "symmetric":
+            score = score.where(override_return >= -override_threshold, -1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & override_return.notna()
+        )
+    if family == "asymmetric_trend_override_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        score = rsi_component + reversal_component
+
+        positive_override_return = (
+            close / close.shift(int(parameters["positive_override_window"]))
+            - 1.0
+        )
+        negative_override_return = (
+            close / close.shift(int(parameters["negative_override_window"]))
+            - 1.0
+        )
+        positive_override = positive_override_return > (
+            float(parameters["positive_override_threshold_pct"]) / 100.0
+        )
+        negative_override = negative_override_return < -(
+            float(parameters["negative_override_threshold_pct"]) / 100.0
+        )
+        score = score.where(~negative_override, -1.0)
+        # Positive trend is the deterministic tie-break if both overrides fire.
+        score = score.where(~positive_override, 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & positive_override_return.notna()
+            & negative_override_return.notna()
+        )
+    if family == "drawdown_recovery_override_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        score = (
+            float(parameters["rsi_weight"]) * rsi_component
+            + float(parameters["reversal_weight"]) * reversal_component
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+    if family == "quiet_bull_recovery_override_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        score = rsi_component + reversal_component
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+
+        bull_ma_window = int(parameters["bull_ma_window"])
+        bull_average = close.rolling(
+            bull_ma_window,
+            min_periods=bull_ma_window,
+        ).mean()
+        bull_slope = (
+            bull_average
+            / bull_average.shift(int(parameters["bull_slope_window"]))
+            - 1.0
+        )
+        bull_return = close / close.shift(bull_ma_window) - 1.0
+        realized_volatility = log_return.rolling(20, min_periods=20).std(
+            ddof=1
+        ) * np.sqrt(252.0)
+        quiet_bull_override = (
+            (close > bull_average)
+            & (bull_slope > 0.0)
+            & (
+                bull_return
+                > float(parameters["bull_min_return_pct"]) / 100.0
+            )
+            & (
+                realized_volatility
+                < float(parameters["bull_max_volatility_pct"]) / 100.0
+            )
+        )
+        score = score.where(~(recovery_override | quiet_bull_override), 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+            & bull_average.notna()
+            & bull_slope.notna()
+            & bull_return.notna()
+            & realized_volatility.notna()
+        )
+    if family == "recovery_trend_breakout_majority":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        recovery_score = rsi_component + reversal_component
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        recovery_score = recovery_score.where(~recovery_override, 1.0)
+        recovery_valid = (
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+        recovery_vote = _state_from_score(recovery_score.where(recovery_valid))
+
+        trend_components = [
+            np.sign(close / close.shift(int(horizon)) - 1.0)
+            for horizon in parameters["trend_horizons"]
+        ]
+        trend_score = pd.concat(trend_components, axis=1).sum(
+            axis=1,
+            min_count=len(trend_components),
+        )
+        trend_vote = _state_from_score(trend_score)
+
+        breakout_window = int(parameters["breakout_window"])
+        prior_high = close.shift(1).rolling(
+            breakout_window,
+            min_periods=breakout_window,
+        ).max()
+        prior_low = close.shift(1).rolling(
+            breakout_window,
+            min_periods=breakout_window,
+        ).min()
+        breakout_valid = prior_high.notna() & prior_low.notna()
+        breakout_vote = _state_from_events(
+            pd.DatetimeIndex(close.index),
+            breakout_valid & (close > prior_high),
+            breakout_valid & (close < prior_low),
+            eligible=breakout_valid,
+        )
+
+        valid = recovery_valid & trend_score.notna() & breakout_valid
+        majority_score = recovery_vote + trend_vote + breakout_vote
+        if (majority_score.loc[valid] == 0).any():
+            raise CandidateRejected("EVEN_ENSEMBLE_VOTE")
+        return majority_score.astype(float).where(valid)
+    if family == "high_vol_crash_recovery_reversal":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        score = rsi_component + reversal_component
+
+        volatility_window = int(parameters["volatility_window"])
+        realized_volatility = log_return.rolling(
+            volatility_window,
+            min_periods=volatility_window,
+        ).std(ddof=1) * np.sqrt(252.0)
+        crash_return = (
+            close / close.shift(int(parameters["crash_window"])) - 1.0
+        )
+        crash_override = (
+            realized_volatility
+            >= float(parameters["high_volatility_pct"]) / 100.0
+        ) & (
+            crash_return
+            <= -(float(parameters["crash_threshold_pct"]) / 100.0)
+        )
+        score = score.where(~crash_override, -1.0)
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        # A confirmed recovery is the deterministic final tie-break.
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & realized_volatility.notna()
+            & crash_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+    if family == "adaptive_recovery_edge_switch":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+        base_score = rsi_component + reversal_component
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        base_score = base_score.where(~recovery_override, 1.0)
+        base_valid = (
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+        base_decision = _state_from_score(base_score.where(base_valid))
+
+        # long_return on row t contains open(t)->open(t+1), so it is only
+        # observable from row t+1. The extra shift keeps the meta-rule causal.
+        base_position = base_decision.shift(1).ffill().fillna(1.0)
+        base_realized_return = (
+            base_position.astype(float) * ledger["long_return"].astype(float)
+        ).shift(1)
+        edge_window = int(parameters["edge_window"])
+        rolling_edge = np.expm1(
+            np.log1p(base_realized_return.clip(lower=-0.999999)).rolling(
+                edge_window,
+                min_periods=edge_window,
+            ).sum()
+        )
+        invert = rolling_edge < (
+            float(parameters["edge_threshold_pct"]) / 100.0
+        )
+        adaptive_decision = base_decision.where(~invert, -base_decision)
+        return adaptive_decision.astype(float).where(base_valid & rolling_edge.notna())
+    if family == "recovery_overnight_tug_vote":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+
+        adjusted_open = ledger["tr_open"].astype(float)
+        overnight = np.log(adjusted_open / close.shift(1))
+        intraday = np.log(close / adjusted_open)
+        tug = (overnight - intraday).rolling(
+            int(parameters["tug_lookback"]),
+            min_periods=int(parameters["tug_lookback"]),
+        ).sum()
+        score = (
+            rsi_component
+            + reversal_component
+            + float(parameters["tug_weight"]) * np.sign(tug)
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & tug.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+    if family == "recovery_turn_month_vote":
+        rsi_window = int(parameters["rsi_window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / rsi_window,
+            adjust=False,
+            min_periods=rsi_window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        rsi = rsi.mask((loss == 0.0) & (gain > 0.0), 100.0)
+        rsi = rsi.mask((gain == 0.0) & (loss > 0.0), 0.0)
+        rsi = rsi.mask((gain == 0.0) & (loss == 0.0), 50.0)
+
+        rsi_trend_return = (
+            close / close.shift(int(parameters["rsi_trend_window"])) - 1.0
+        )
+        rsi_component = np.sign(rsi_trend_return)
+        rsi_component = rsi_component.where(
+            rsi > float(parameters["lower"]), 1.0
+        )
+        rsi_component = rsi_component.where(
+            rsi < float(parameters["upper"]), -1.0
+        )
+        reversal_return = (
+            close / close.shift(int(parameters["reversal_window"])) - 1.0
+        )
+        reversal_trend_return = (
+            close / close.shift(int(parameters["reversal_trend_window"])) - 1.0
+        )
+        reversal_component = np.sign(reversal_trend_return)
+        reversal_threshold = (
+            float(parameters["reversal_threshold_pct"]) / 100.0
+        )
+        reversal_component = reversal_component.where(
+            reversal_return.abs() < reversal_threshold,
+            -np.sign(reversal_return),
+        )
+
+        session_frame = pd.DataFrame(index=ledger.index)
+        session_frame["month"] = ledger.index.to_period("M")
+        session_frame["from_start"] = (
+            session_frame.groupby("month").cumcount() + 1
+        )
+        session_frame["from_end"] = (
+            session_frame.groupby("month").cumcount(ascending=False) + 1
+        )
+        next_position = session_frame[["from_start", "from_end"]].shift(-1)
+        turn_month = (
+            next_position["from_start"] <= int(parameters["first_sessions"])
+        ) | (next_position["from_end"] <= int(parameters["last_sessions"]))
+        score = (
+            rsi_component
+            + reversal_component
+            + float(parameters["calendar_weight"]) * turn_month.astype(float)
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            rsi.notna()
+            & rsi_trend_return.notna()
+            & reversal_return.notna()
+            & reversal_trend_return.notna()
+            & rolling_peak.notna()
+            & recovery_return.notna()
+        )
+    if family == "recovery_internal_bar_strength_vote":
+        base_score = _price_score(
+            {
+                "family": "drawdown_recovery_override_reversal",
+                "parameters": parameters,
+            },
+            data,
+            feature_frame=feature_frame,
+        )
+        high = ledger["high"].astype(float)
+        low = ledger["low"].astype(float)
+        ibs = (close - low) / (high - low).replace(0.0, np.nan)
+        smooth_window = int(parameters["ibs_smooth_window"])
+        smoothed_ibs = ibs.rolling(
+            smooth_window,
+            min_periods=smooth_window,
+        ).mean()
+        ibs_component = pd.Series(0.0, index=ledger.index)
+        ibs_component = ibs_component.where(
+            smoothed_ibs > float(parameters["ibs_lower"]), 1.0
+        )
+        ibs_component = ibs_component.where(
+            smoothed_ibs < float(parameters["ibs_upper"]), -1.0
+        )
+        score = base_score + float(parameters["ibs_weight"]) * ibs_component
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(base_score.notna() & smoothed_ibs.notna())
+    if family == "recovery_multi_horizon_reversal_vote":
+        base_score = _price_score(
+            {
+                "family": "drawdown_recovery_override_reversal",
+                "parameters": parameters,
+            },
+            data,
+            feature_frame=feature_frame,
+        )
+        horizon_returns = [
+            close / close.shift(int(horizon)) - 1.0
+            for horizon in parameters["multi_horizons"]
+        ]
+        mean_horizon_return = pd.concat(horizon_returns, axis=1).mean(
+            axis=1,
+            skipna=False,
+        )
+        threshold = float(parameters["multi_threshold_pct"]) / 100.0
+        multi_component = pd.Series(0.0, index=ledger.index)
+        multi_component = multi_component.where(
+            mean_horizon_return > -threshold, 1.0
+        )
+        multi_component = multi_component.where(
+            mean_horizon_return < threshold, -1.0
+        )
+        score = (
+            base_score
+            + float(parameters["multi_reversal_weight"]) * multi_component
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(base_score.notna() & mean_horizon_return.notna())
+    if family == "recovery_volume_gated_reversal_vote":
+        base_score = _price_score(
+            {
+                "family": "drawdown_recovery_override_reversal",
+                "parameters": parameters,
+            },
+            data,
+            feature_frame=feature_frame,
+        )
+        volume = ledger["volume"].astype(float)
+        volume_z = _rolling_zscore(
+            np.log1p(volume),
+            int(parameters["volume_window"]),
+        )
+        lag_return = (
+            close / close.shift(int(parameters["volume_return_lookback"])) - 1.0
+        )
+        volume_component = pd.Series(0.0, index=ledger.index)
+        high_volume = volume_z >= float(parameters["volume_z_threshold"])
+        volume_component = volume_component.where(
+            ~(high_volume & (lag_return < 0.0)), 1.0
+        )
+        volume_component = volume_component.where(
+            ~(high_volume & (lag_return > 0.0)), -1.0
+        )
+        score = (
+            base_score
+            + float(parameters["volume_reversal_weight"]) * volume_component
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            base_score.notna() & volume_z.notna() & lag_return.notna()
+        )
+    if family == "recovery_calendar_volume_reversal_vote":
+        base_score = _price_score(
+            {
+                "family": "drawdown_recovery_override_reversal",
+                "parameters": parameters,
+            },
+            data,
+            feature_frame=feature_frame,
+        )
+        volume = ledger["volume"].astype(float)
+        volume_z = _rolling_zscore(
+            np.log1p(volume),
+            int(parameters["volume_window"]),
+        )
+        lag_return = (
+            close / close.shift(int(parameters["volume_return_lookback"])) - 1.0
+        )
+        volume_component = pd.Series(0.0, index=ledger.index)
+        high_volume = volume_z >= float(parameters["volume_z_threshold"])
+        volume_component = volume_component.where(
+            ~(high_volume & (lag_return < 0.0)), 1.0
+        )
+        volume_component = volume_component.where(
+            ~(high_volume & (lag_return > 0.0)), -1.0
+        )
+
+        session_frame = pd.DataFrame(index=ledger.index)
+        session_frame["month"] = ledger.index.to_period("M")
+        session_frame["from_start"] = (
+            session_frame.groupby("month").cumcount() + 1
+        )
+        session_frame["from_end"] = (
+            session_frame.groupby("month").cumcount(ascending=False) + 1
+        )
+        next_position = session_frame[["from_start", "from_end"]].shift(-1)
+        turn_month = (
+            next_position["from_start"] <= int(parameters["first_sessions"])
+        ) | (next_position["from_end"] <= int(parameters["last_sessions"]))
+        score = (
+            base_score
+            + float(parameters["calendar_weight"]) * turn_month.astype(float)
+            + float(parameters["volume_reversal_weight"]) * volume_component
+        )
+
+        drawdown_lookback = int(parameters["drawdown_lookback"])
+        rolling_peak = close.rolling(
+            drawdown_lookback,
+            min_periods=drawdown_lookback,
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+        return score.where(
+            base_score.notna() & volume_z.notna() & lag_return.notna()
+        )
+    if family == "recovery_calendar_volume_vxo_vote":
+        base_score = _price_score(
+            {
+                "family": "recovery_calendar_volume_reversal_vote",
+                "parameters": parameters,
+            },
+            data,
+            feature_frame=feature_frame,
+        )
+        vxo = _series(data, "VXO").astype(float)
+        vxo_change = np.log(
+            vxo / vxo.shift(int(parameters["vxo_change_lookback"]))
+        )
+        vxo_z = _rolling_zscore(
+            vxo_change,
+            int(parameters["vxo_z_window"]),
+        )
+        active = vxo_z.abs() >= float(parameters["vxo_z_threshold"])
+        direction = np.sign(vxo_change)
+        if str(parameters["vxo_mode"]) == "reversal":
+            direction = -direction
+        vxo_component = direction.where(active, 0.0)
+        vxo_gate_valid = pd.Series(True, index=ledger.index)
+        if "vxo_negative_gate_window" in parameters:
+            gate_return = (
+                close / close.shift(int(parameters["vxo_negative_gate_window"])) - 1.0
+            )
+            gate_threshold = (
+                float(parameters["vxo_negative_gate_threshold_pct"]) / 100.0
+            )
+            vxo_component = vxo_component.where(
+                (vxo_component >= 0.0) | (gate_return <= gate_threshold),
+                0.0,
+            )
+            vxo_gate_valid = gate_return.notna()
+        if "vxo_positive_weight" in parameters or "vxo_negative_weight" in parameters:
+            positive_weight = float(
+                parameters.get("vxo_positive_weight", parameters["vxo_weight"])
+            )
+            negative_weight = float(
+                parameters.get("vxo_negative_weight", parameters["vxo_weight"])
+            )
+            weighted_vxo_component = (
+                vxo_component.clip(lower=0.0) * positive_weight
+                + vxo_component.clip(upper=0.0) * negative_weight
+            )
+            score = base_score + weighted_vxo_component
+        else:
+            score = base_score + float(parameters["vxo_weight"]) * vxo_component
+
+        slow_trend_valid = pd.Series(True, index=ledger.index)
+        if "slow_trend_weight" in parameters:
+            slow_trend_return = (
+                close / close.shift(int(parameters["slow_trend_window"])) - 1.0
+            )
+            score = score + float(parameters["slow_trend_weight"]) * np.sign(
+                slow_trend_return
+            )
+            slow_trend_valid = slow_trend_return.notna()
+
+        tug_valid = pd.Series(True, index=ledger.index)
+        if "tug_weight" in parameters:
+            adjusted_open = ledger["tr_open"].astype(float)
+            overnight = np.log(adjusted_open / close.shift(1))
+            intraday = np.log(close / adjusted_open)
+            tug = (overnight - intraday).rolling(
+                int(parameters["tug_lookback"]),
+                min_periods=int(parameters["tug_lookback"]),
+            ).sum()
+            score = score + float(parameters["tug_weight"]) * np.sign(tug)
+            tug_valid = tug.notna()
+
+        rolling_peak = close.rolling(
+            int(parameters["drawdown_lookback"]),
+            min_periods=int(parameters["drawdown_lookback"]),
+        ).max()
+        drawdown = close / rolling_peak - 1.0
+        recent_deep_drawdown = drawdown.rolling(
+            int(parameters["recovery_memory_window"]),
+            min_periods=1,
+        ).min() <= -(float(parameters["drawdown_trigger_pct"]) / 100.0)
+        recovery_return = (
+            close / close.shift(int(parameters["recovery_window"])) - 1.0
+        )
+        recovery_override = recent_deep_drawdown & (
+            recovery_return
+            > float(parameters["recovery_threshold_pct"]) / 100.0
+        )
+        score = score.where(~recovery_override, 1.0)
+
+        short_gate_valid = pd.Series(True, index=ledger.index)
+        if "short_gate_window" in parameters:
+            short_gate_return = (
+                close / close.shift(int(parameters["short_gate_window"])) - 1.0
+            )
+            short_gate_threshold = (
+                float(parameters["short_gate_threshold_pct"]) / 100.0
+            )
+            score = score.where(
+                (score >= 0.0) | (short_gate_return <= short_gate_threshold),
+                1.0,
+            )
+            short_gate_valid = short_gate_return.notna()
+
+        short_drawdown_gate_valid = pd.Series(True, index=ledger.index)
+        if "short_drawdown_gate_window" in parameters:
+            short_drawdown_peak = close.rolling(
+                int(parameters["short_drawdown_gate_window"]),
+                min_periods=int(parameters["short_drawdown_gate_window"]),
+            ).max()
+            short_drawdown = close / short_drawdown_peak - 1.0
+            short_drawdown_threshold = (
+                -float(parameters["short_drawdown_gate_threshold_pct"]) / 100.0
+            )
+            score = score.where(
+                (score >= 0.0) | (short_drawdown <= short_drawdown_threshold),
+                1.0,
+            )
+            short_drawdown_gate_valid = short_drawdown.notna()
+        return score.where(
+            base_score.notna()
+            & vxo_z.notna()
+            & vxo_gate_valid
+            & slow_trend_valid
+            & tug_valid
+            & short_gate_valid
+            & short_drawdown_gate_valid
+        )
     if family == "trend_ensemble":
         components = []
         for horizon in parameters["horizons"]:
@@ -417,6 +1781,84 @@ def _volume_reversal_decisions(candidate: Mapping[str, Any], data: PreparedMarke
     )
 
 
+def _targeted_reversal_decisions(
+    candidate: Mapping[str, Any],
+    data: PreparedMarketData,
+) -> pd.Series:
+    """Causal event rules for the targeted post-batch-2 train search."""
+
+    family = str(candidate["family"])
+    p = candidate["parameters"]
+    ledger = data.ledger
+    close = ledger["tr_close"].astype(float)
+    if family == "internal_bar_strength_reversal":
+        high = ledger["high"].astype(float)
+        low = ledger["low"].astype(float)
+        ibs = (close - low) / (high - low).replace(0.0, np.nan)
+        lower = float(p["lower"])
+        upper = float(p["upper"])
+        return _state_from_events(
+            ledger.index,
+            ibs <= lower,
+            ibs >= upper,
+            eligible=ibs.notna(),
+        )
+    if family == "intraday_return_reversal":
+        threshold = float(p["threshold_pct"]) / 100.0
+        intraday_return = close / ledger["tr_open"].astype(float) - 1.0
+        return _state_from_events(
+            ledger.index,
+            intraday_return <= -threshold,
+            intraday_return >= threshold,
+            eligible=intraday_return.notna(),
+        )
+    if family == "return_threshold_reversal":
+        lookback = int(p["lookback"])
+        threshold = float(p["threshold_pct"]) / 100.0
+        lag_return = close / close.shift(lookback) - 1.0
+        return _state_from_events(
+            ledger.index,
+            lag_return <= -threshold,
+            lag_return >= threshold,
+            eligible=lag_return.notna(),
+        )
+    if family == "rsi_reversal":
+        window = int(p["window"])
+        delta = close.diff()
+        gain = delta.clip(lower=0.0).ewm(
+            alpha=1.0 / window,
+            adjust=False,
+            min_periods=window,
+        ).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(
+            alpha=1.0 / window,
+            adjust=False,
+            min_periods=window,
+        ).mean()
+        relative_strength = gain / loss.replace(0.0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + relative_strength)
+        lower = float(p["lower"])
+        upper = float(p["upper"])
+        return _state_from_events(
+            ledger.index,
+            rsi <= lower,
+            rsi >= upper,
+            eligible=rsi.notna(),
+        )
+    if family == "streak_reversal":
+        required = int(p["streak"])
+        direction = np.sign(close.diff()).fillna(0.0)
+        groups = direction.ne(direction.shift()).cumsum()
+        streak = direction * direction.groupby(groups).cumcount().add(1)
+        return _state_from_events(
+            ledger.index,
+            streak <= -required,
+            streak >= required,
+            eligible=direction.ne(0.0),
+        )
+    raise CandidateRejected(f"NOT_A_TARGETED_REVERSAL_FAMILY:{family}")
+
+
 def _vix_extreme_decisions(candidate: Mapping[str, Any], data: PreparedMarketData) -> pd.Series:
     p = candidate["parameters"]
     vix = _series(data, "VIX")
@@ -516,6 +1958,14 @@ def candidate_decisions(
         decisions = _price_breakout_decisions(candidate, data)
     elif family == "volume_conditioned_reversal":
         decisions = _volume_reversal_decisions(candidate, data)
+    elif family in {
+        "internal_bar_strength_reversal",
+        "intraday_return_reversal",
+        "return_threshold_reversal",
+        "rsi_reversal",
+        "streak_reversal",
+    }:
+        decisions = _targeted_reversal_decisions(candidate, data)
     elif family == "vix_extreme_reversal":
         decisions = _vix_extreme_decisions(candidate, data)
     elif family == "calendar_seasonality":
@@ -532,9 +1982,30 @@ def candidate_decisions(
         "price_trend_sma",
         "time_series_momentum",
         "short_horizon_reversal",
+        "multi_horizon_reversal",
+        "reversal_trend_blend",
+        "rsi_trend_blend",
         "trend_ensemble",
         "dual_ma_cross",
-        "realized_volatility_state",
+        "dual_reversal_trend_vote",
+        "trend_guarded_dual_reversal",
+        "volatility_regime_reversal",
+            "overnight_tug_reversal_vote",
+            "strong_trend_override_reversal",
+            "asymmetric_trend_override_reversal",
+            "drawdown_recovery_override_reversal",
+            "quiet_bull_recovery_override_reversal",
+            "recovery_trend_breakout_majority",
+            "high_vol_crash_recovery_reversal",
+            "adaptive_recovery_edge_switch",
+            "recovery_overnight_tug_vote",
+            "recovery_turn_month_vote",
+            "recovery_internal_bar_strength_vote",
+            "recovery_multi_horizon_reversal_vote",
+            "recovery_volume_gated_reversal_vote",
+            "recovery_calendar_volume_reversal_vote",
+            "recovery_calendar_volume_vxo_vote",
+            "realized_volatility_state",
         "overnight_futures_proxy",
         "volatility_conditioned_trend",
     }:

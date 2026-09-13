@@ -32,3 +32,14 @@ state_street_spy_distributions_2011_2020.csv
 Validation remains unavailable until train selection is cryptographically
 frozen and the exact `OPEN_VALIDATION_2011_2020_ONCE` acknowledgement is
 supplied. A file or response containing 2021 or later is rejected.
+
+VXO uses Cboe's official daily history file, frozen into two physical phase
+captures so train cannot read validation and validation cannot read locked:
+
+```text
+cboe_vxo_daily_1993_2010.csv
+cboe_vxo_daily_2011_2020.csv
+```
+
+The source is Cboe's `VXO_History.csv`. The campaign uses the daily close with
+one session of causal lag. Neither capture contains a row dated 2021 or later.

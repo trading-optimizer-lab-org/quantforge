@@ -1,0 +1,58 @@
+name: Download artifact with retries
+description: Download one GitHub Actions artifact with bounded retries
+inputs:
+  artifact-name:
+    description: Exact artifact name
+    required: true
+  output-dir:
+    description: Destination directory
+    required: true
+  run-id:
+    description: Source workflow run id; defaults to the current run
+    required: false
+    default: ""
+  attempts:
+    description: Maximum download attempts
+    required: false
+    default: "6"
+runs:
+  using: composite
+  steps:
+    - name: Download artifact with bounded retries
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+        CURRENT_RUN_ID: ${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        artifact_name="${{ inputs.artifact-name }}"
+        output_dir="${{ inputs.output-dir }}"
+        run_id="${{ inputs.run-id }}"
+        attempts="${{ inputs.attempts }}"
+        if [ -z "$run_id" ]; then
+          run_id="$CURRENT_RUN_ID"
+        fi
+
+        for attempt in $(seq 1 "$attempts"); do
+          temp_dir="${output_dir}.attempt-${attempt}"
+          rm -rf "$temp_dir"
+          mkdir -p "$temp_dir"
+          if gh run download "$run_id" \
+            --repo "$REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$temp_dir"; then
+            rm -rf "$output_dir"
+            mkdir -p "$output_dir"
+            cp -a "$temp_dir"/. "$output_dir"/
+            rm -rf "$temp_dir"
+            exit 0
+          fi
+          rm -rf "$temp_dir"
+          if [ "$attempt" -lt "$attempts" ]; then
+            sleep $((attempt * 10))
+          fi
+        done
+
+        echo "Unable to download artifact $artifact_name from run $run_id after $attempts attempts" >&2
+        exit 1

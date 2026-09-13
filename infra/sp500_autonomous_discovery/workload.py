@@ -47,6 +47,11 @@ from aurora.infra.sp500_long_short_daily.workload import (
 from .contracts import LOCKED_START, TRAIN_END
 from .dedupe import build_dedupe_map
 from .feature_store import FeatureStore
+from .historical_evidence import (
+    install_historical_evidence,
+    install_prior_autonomous_evidence,
+    prepared_evidence_files,
+)
 from .registry import (
     base_package,
     generate_candidates,
@@ -82,6 +87,25 @@ def _candidate_count(default: int) -> int:
     return int(value)
 
 
+def freeze_selection_reason(finalists: Sequence[Mapping[str, Any]]) -> str:
+    return (
+        "all frozen train gates passed"
+        if finalists
+        else "no candidate passed all frozen train gates"
+    )
+
+
+def freeze_rejection_reasons(
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    return {
+        str(row.get("strategy_id")): str(row.get("rejection_reason") or "")
+        for row in candidates
+        if row.get("status") != "evaluated"
+        and str(row.get("rejection_reason") or "").strip()
+    }
+
+
 def _light_package(candidates: Sequence[Mapping[str, Any]]) -> CampaignPackage:
     package = base_package()
     return CampaignPackage(
@@ -93,6 +117,78 @@ def _light_package(candidates: Sequence[Mapping[str, Any]]) -> CampaignPackage:
         datasets=package.datasets,
         research=package.research,
     )
+
+
+def refresh_autonomous_prepared_inputs(root: Path) -> tuple[dict[str, Any], ...]:
+    """Refresh batch-specific inputs while preserving immutable market data."""
+
+    root = Path(root).resolve()
+    batch_id = _batch_id()
+    count = _candidate_count(AutonomousDiscoveryWorkload.default_candidate_count)
+    prior_ledger_value = os.environ.get(
+        "AURORA_PRIOR_TRIAL_LEDGER_PATH", ""
+    ).strip()
+    pilot_source = os.environ.get(
+        "AURORA_AUTONOMOUS_PILOT_EVIDENCE_ROOT", ""
+    ).strip()
+    install_prior_autonomous_evidence(
+        root,
+        pilot_result_root=Path(pilot_source) if pilot_source else None,
+        prior_result_root=(
+            Path(prior_ledger_value).parent if prior_ledger_value else None
+        ),
+    )
+    candidates = generate_candidates(batch_id, count=count)
+    write_batch_registry(
+        root,
+        batch_id=batch_id,
+        candidates=candidates,
+        previous_trial_count=get_previous_trial_count(),
+    )
+    with (root / "dedupe_map.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        dedupe_rows = build_dedupe_map(candidates)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "strategy_id",
+                "canonical_hash",
+                "canonical_strategy_id",
+                "deduped",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(dedupe_rows)
+    priced = [
+        {
+            **candidate,
+            "cost_score": cost_score(
+                family_timeout_rate=float(candidate.get("complexity_score", 1))
+                / 10.0,
+                concept_timeout_rate=float(candidate.get("complexity_score", 1))
+                / 20.0,
+            ),
+        }
+        for candidate in candidates
+    ]
+    with (root / "job_manifest.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        manifest_rows = assign_by_cost(priced, max(1, min(360, len(priced))))
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "job_id",
+                "strategy_id",
+                "canonical_hash",
+                "cost_score",
+                "estimated_cost_bucket",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+    return candidates
 
 
 class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
@@ -135,35 +231,12 @@ class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
         return Path(root).resolve() / "candidate_registry.jsonl"
 
     def _prepare_dataset(self, root: Path) -> tuple[tuple[str, ...], str]:
-        batch_id = _batch_id()
-        count = _candidate_count(self.default_candidate_count)
-        candidates = generate_candidates(batch_id, count=count)
-        write_batch_registry(
-            root,
-            batch_id=batch_id,
-            candidates=candidates,
-            previous_trial_count=get_previous_trial_count(),
-        )
-        with (Path(root) / "dedupe_map.csv").open("w", newline="", encoding="utf-8") as handle:
-            dedupe_rows = build_dedupe_map(candidates)
-            writer = csv.DictWriter(handle, fieldnames=["strategy_id", "canonical_hash", "canonical_strategy_id", "deduped"])
-            writer.writeheader()
-            writer.writerows(dedupe_rows)
-        priced = [
-            {
-                **candidate,
-                "cost_score": cost_score(
-                    family_timeout_rate=float(candidate.get("complexity_score", 1)) / 10.0,
-                    concept_timeout_rate=float(candidate.get("complexity_score", 1)) / 20.0,
-                ),
-            }
-            for candidate in candidates
-        ]
-        with (Path(root) / "job_manifest.csv").open("w", newline="", encoding="utf-8") as handle:
-            manifest_rows = assign_by_cost(priced, max(1, min(360, len(priced))))
-            writer = csv.DictWriter(handle, fieldnames=["job_id", "strategy_id", "canonical_hash", "cost_score", "estimated_cost_bucket"])
-            writer.writeheader()
-            writer.writerows(manifest_rows)
+        historical_source = os.environ.get(
+            "AURORA_HISTORICAL_MULTIPLICITY_SOURCE", ""
+        ).strip()
+        if historical_source:
+            install_historical_evidence(Path(historical_source), root)
+        candidates = refresh_autonomous_prepared_inputs(root)
         package = _light_package(candidates)
         manifest = prepare_market_snapshot(
             root,
@@ -198,6 +271,7 @@ class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
             "dataset_registry_source.csv",
             "trial_ledger.jsonl",
             "autonomous_trial_ledger.parquet",
+            *prepared_evidence_files(root),
         ), str(manifest["snapshot_sha256"])
 
     def _load_dataset(self, root: Path) -> PreparedMarketData:
@@ -341,6 +415,7 @@ class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
             root,
             batch_id=_batch_id(),
             previous_trial_count=get_previous_trial_count(),
+            prepared_root=self._prepared_root(),
         )
         (root / "candidate_registry.jsonl").write_text(
             self._registry_path(self._prepared_root()).read_text(encoding="utf-8"),
@@ -386,8 +461,15 @@ class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
             "autonomous_trial_ledger.parquet",
         ):
             source = prepared_root / filename
-            if source.is_file():
+            if source.is_file() and not (root / filename).is_file():
                 shutil.copy2(source, root / filename)
+        historical_source = prepared_root / "historical_multiplicity"
+        if historical_source.is_dir():
+            historical_target = root / "historical_multiplicity"
+            historical_target.mkdir(parents=True, exist_ok=True)
+            for source in historical_source.iterdir():
+                if source.is_file() and not (historical_target / source.name).is_file():
+                    shutil.copy2(source, historical_target / source.name)
         self._finalize_train_freeze(root, summary)
         (root / "autonomous_batch_identity.json").write_text(
             json.dumps({
@@ -460,12 +542,12 @@ class AutonomousDiscoveryWorkload(Sp500LongShortTrainWorkload):
                 "train_oof_metrics": list(freeze.get("finalists", [])),
                 "outer_fold_metrics_file": "train_fold_metrics.csv",
                 "multiple_testing_results": read_json(root / "multiple_testing.json"),
-                "selection_reason": "all frozen train gates passed",
-                "rejection_reasons": {
-                    str(row.get("strategy_id")): str(row.get("rejection_reason"))
-                    for row in self._candidate_rows()
-                    if row.get("status") != "evaluated"
-                },
+                "selection_reason": freeze_selection_reason(
+                    freeze.get("finalists", [])
+                ),
+                "rejection_reasons": freeze_rejection_reasons(
+                    self._candidate_rows()
+                ),
                 "authorization_token_required": "OPEN_VALIDATION_2011_2020_ONCE_AUTONOMOUS",
                 "locked_state": "closed",
                 "timestamp": commit_sha,

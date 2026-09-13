@@ -11,6 +11,33 @@
       "url": "https://web.archive.org/web/20110103050231id_/https://www.spdrs.com/resources/distributions/index.seam"
     },
     {
+      "id": "state_street_exact_events_2011_2020",
+      "maximum_observation": "2020-12-18",
+      "role": "exact_validation_event_date_and_amount_verification",
+      "source_capture_scope": "SPY rows with ex_date from 2011-01-01 through 2020-12-31",
+      "url": "https://www.ssga.com/bin/v1/ssmp/fund/dividend-distribution?country=us&language=en&role=intermediary&product=etfs&ticker=SPY"
+    },
+    {
+      "full_source_capture_sha256": "62b36d948c2f353c645785ae03067f732702d7dc03d5a1a9d60ab6f0242da3a9",
+      "id": "cboe_vxo_daily_1993_2010",
+      "maximum_observation": "2010-12-31",
+      "minimum_observation": "1993-01-29",
+      "phase_capture_sha256": "686754a629c49246f7999a0d9084c420262900806acf8f566e5b45aa770ba563",
+      "role": "train_only_causal_vxo_close",
+      "rows": 4515,
+      "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXO_History.csv"
+    },
+    {
+      "full_source_capture_sha256": "62b36d948c2f353c645785ae03067f732702d7dc03d5a1a9d60ab6f0242da3a9",
+      "id": "cboe_vxo_daily_2011_2020",
+      "maximum_observation": "2020-12-31",
+      "minimum_observation": "2011-01-03",
+      "phase_capture_sha256": "b890a33573d982bba54f406e3e21d7c256d5b84b1db1fc24a6f685b420a8071b",
+      "role": "validation_only_causal_vxo_close",
+      "rows": 2514,
+      "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXO_History.csv"
+    },
+    {
       "id": "sec_audited_totals_1993_1995",
       "role": "audited_fiscal_total_verification",
       "url": "https://www.sec.gov/Archives/edgar/data/884394/000091205796003840/0000912057-96-003840.txt"

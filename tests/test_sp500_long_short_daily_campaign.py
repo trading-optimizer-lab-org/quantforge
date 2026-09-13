@@ -43,6 +43,7 @@ from aurora.infra.sp500_long_short_daily.data import (
     _solve_stooq_browser_verification,
     download_stooq_history,
     download_alfred_initial_series,
+    load_cboe_vxo_history,
     load_sec_distribution_totals,
     load_state_street_distributions,
     reconcile_official_distribution_audit,
@@ -1726,6 +1727,83 @@ def test_cboe_first_dissemination_blocks_retrospective_backfill() -> None:
     assert aligned.loc[pd.Timestamp("2003-09-22")] == 20.0
 
 
+def test_vxo_first_dissemination_blocks_pre_launch_backfill() -> None:
+    sessions = pd.DatetimeIndex(
+        [
+            pd.Timestamp("1993-01-18"),
+            pd.Timestamp("1993-01-19"),
+            pd.Timestamp("1993-01-20"),
+        ]
+    )
+    releases = pd.DataFrame(
+        {
+            "release_date": [pd.Timestamp("1986-01-02")],
+            "value": [20.0],
+        }
+    )
+    aligned = _align_initial_releases(
+        releases,
+        sessions,
+        first_dissemination=pd.Timestamp("1993-01-19"),
+    )
+    assert pd.isna(aligned.loc[pd.Timestamp("1993-01-18")])
+    assert aligned.loc[pd.Timestamp("1993-01-19")] == 20.0
+
+
+def test_cboe_vxo_train_capture_is_phase_bounded_and_causal() -> None:
+    path = (
+        _repo_campaign_root()
+        / "official_inputs"
+        / "cboe_vxo_daily_1993_2010.csv"
+    )
+    series, receipt = load_cboe_vxo_history(
+        path,
+        "1993-01-22",
+        "2010-12-31",
+        split="train",
+    )
+    assert series.index.min() == pd.Timestamp("1993-01-29")
+    assert series.index.max() == pd.Timestamp("2010-12-31")
+    assert len(series) == 4515
+    assert receipt.dataset_id == "DS005"
+    assert receipt.status == "loaded_phase_bounded_official_cboe_history"
+
+
+def test_cboe_vxo_validation_capture_contains_no_locked_rows() -> None:
+    path = (
+        _repo_campaign_root()
+        / "official_inputs"
+        / "cboe_vxo_daily_2011_2020.csv"
+    )
+    series, _ = load_cboe_vxo_history(
+        path,
+        "2011-01-01",
+        "2020-12-31",
+        split="validation",
+    )
+    assert series.index.min() == pd.Timestamp("2011-01-03")
+    assert series.index.max() == pd.Timestamp("2020-12-31")
+    assert len(series) == 2514
+    assert (series.index < pd.Timestamp("2021-01-01")).all()
+
+
+def test_cboe_vxo_loader_rejects_rows_beyond_requested_phase(tmp_path: Path) -> None:
+    path = tmp_path / "vxo.csv"
+    path.write_text(
+        "DATE,OPEN,HIGH,LOW,CLOSE\n"
+        "12/31/2010,20,20,20,20\n"
+        "01/03/2011,21,21,21,21\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DataGateError, match="UNBOUNDED_SOURCE_RESPONSE"):
+        load_cboe_vxo_history(
+            path,
+            "1993-01-22",
+            "2010-12-31",
+            split="train",
+        )
+
+
 def test_cboe_series_after_train_is_rejected_instead_of_backfilled() -> None:
     candidate = _campaign().candidate_by_id()["STRAT0019"]
     base = _long_fixture()
@@ -2095,7 +2173,7 @@ def test_phase_workloads_are_bounded_and_have_exact_unit_counts() -> None:
 def test_every_frozen_family_is_implemented_or_has_a_precise_rejection() -> None:
     package_families = {row["family"] for row in _campaign().candidates}
     assert IMPLEMENTED_FAMILIES.isdisjoint(EXPLICIT_FAMILY_REJECTIONS)
-    assert package_families == IMPLEMENTED_FAMILIES | set(EXPLICIT_FAMILY_REJECTIONS)
+    assert package_families <= IMPLEMENTED_FAMILIES | set(EXPLICIT_FAMILY_REJECTIONS)
 
 
 def test_effective_trial_count_collapses_identical_strategies() -> None:
@@ -2489,10 +2567,14 @@ def test_workflow_exposes_fail_closed_one_shot_validation() -> None:
     assert "dt.timedelta(days=44)" not in universal
     assert '--source-mode "yahoo-fallback"' in universal
     assert "prepared_artifact_run_id" in universal
-    assert universal.count("inputs.prepared_artifact_run_id || github.run_id") == 14
-    assert universal.count(
-        "prepared-artifact-run-id: ${{ inputs.prepared_artifact_run_id }}"
-    ) == 8
+    assert "AURORA_PREPARED_ARTIFACT_RUN_ID:" in universal
+    universal_lines = [line.strip() for line in universal.splitlines()]
+    assert universal_lines.count(
+        "run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}"
+    ) == 9
+    assert universal_lines.count(
+        "prepared-artifact-run-id: ${{ env.AURORA_PREPARED_ARTIFACT_RUN_ID }}"
+    ) == 12
     assert "needs.prepare_data.result == 'success'" in universal
 
     retry_action = (

@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -41,6 +42,9 @@ from .registry import base_package, read_batch_registry
 
 
 VALIDATION_ACK = "OPEN_VALIDATION_2011_2020_ONCE_AUTONOMOUS"
+EXPLORATORY_VALIDATION_ACK = (
+    "OPEN_EXPLORATORY_VALIDATION_2011_2020_OWNER_AUTHORIZED"
+)
 
 
 class ValidationGateError(RuntimeError):
@@ -161,6 +165,159 @@ def _evaluate(
         row["status"] = "rejected"
         row["rejection_reason"] = str(exc)
         return row, [], []
+
+
+def _candidate_from_registry(
+    registry: Sequence[Mapping[str, Any]], strategy_id: str
+) -> Mapping[str, Any]:
+    matches = [row for row in registry if str(row.get("strategy_id")) == strategy_id]
+    if len(matches) != 1:
+        raise ValidationGateError("EXPLORATORY_CANDIDATE_NOT_UNIQUE_IN_REGISTRY")
+    return matches[0]
+
+
+def exploratory_validation_package(
+    train_results_dir: Path, strategy_id: str
+) -> Any:
+    """Return the base package scoped to the exact exploratory candidate."""
+
+    registry = read_batch_registry(Path(train_results_dir))
+    candidate = _candidate_from_registry(registry, strategy_id)
+    return replace(base_package(), candidates=(candidate,))
+
+
+def run_exploratory_validation(
+    *,
+    train_results_dir: Path,
+    validation_prepared_dir: Path,
+    output_dir: Path,
+    strategy_id: str,
+    validation_ack: str,
+) -> Mapping[str, Any]:
+    """Evaluate one owner-authorized train candidate without claiming confirmation.
+
+    This deliberately does not weaken or call ``run_validation_once``. The output is
+    labelled exploratory because the candidate did not pass the frozen train gates.
+    Locked data remain inaccessible.
+    """
+    if validation_ack != EXPLORATORY_VALIDATION_ACK:
+        raise ValidationGateError("EXPLORATORY_VALIDATION_ACK_MISMATCH")
+    train_results_dir = Path(train_results_dir).resolve()
+    validation_prepared_dir = Path(validation_prepared_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    freeze = _verify_freeze(
+        train_results_dir / "train_selection_freeze.json",
+        require_finalized=False,
+    )
+    registry = read_batch_registry(train_results_dir)
+    candidate = _candidate_from_registry(registry, strategy_id)
+    data = load_market_snapshot(validation_prepared_dir)
+    if (
+        data.ledger.index.min() < pd.Timestamp(VALIDATION_WARMUP_START)
+        or data.ledger.index.max() > pd.Timestamp(VALIDATION_END)
+    ):
+        raise ValidationGateError("VALIDATION_BOUNDARY_BREACH")
+
+    manifest = json.loads(
+        (validation_prepared_dir / "market_data_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    feature_store = FeatureStore(
+        dataset_sha256=str(manifest["snapshot_sha256"]),
+        code_sha=os.environ.get("GITHUB_SHA", "LOCAL_TEST_ONLY"),
+        start=VALIDATION_WARMUP_START,
+        end=VALIDATION_END,
+    )
+    feature_frame = feature_store.get_or_build("SPY", data.ledger)
+    (output_dir / "feature_store_manifest.json").write_text(
+        json.dumps(feature_store.manifest(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    lookup = base_package().candidate_by_id()
+    lookup.update({str(row["strategy_id"]): row for row in registry})
+    row, daily, annual = _evaluate(
+        data,
+        candidate,
+        lookup,
+        feature_frame,
+    )
+    row["confirmatory_result"] = False
+    row["owner_authorized_exploratory"] = True
+
+    rows = [row]
+    for benchmark_id in BENCHMARK_IDS:
+        signal = benchmark_decisions(benchmark_id, data)
+        applied = apply_positions(data.ledger, signal.decisions)
+        returns = applied["strategy_return"].dropna().astype(float)
+        metric = primary_metric_record(
+            f"BENCHMARK::{benchmark_id}",
+            "validation",
+            returns.to_numpy(),
+            periods_per_year=252,
+        )
+        rows.append(
+            {
+                "strategy_id": f"BENCHMARK::{benchmark_id}",
+                "unit_type": "benchmark",
+                "status": "evaluated",
+                **{f"validation_{key}": value for key, value in metric.reported.items()},
+            }
+        )
+
+    pd.DataFrame(rows).to_csv(output_dir / "validation_metrics.csv", index=False)
+    pd.DataFrame(annual).to_csv(
+        output_dir / "validation_annual_metrics.csv", index=False
+    )
+    if daily:
+        pq.write_table(
+            pa.Table.from_pylist(daily),
+            output_dir / "validation_daily_returns.parquet",
+        )
+    else:
+        pd.DataFrame(
+            columns=["strategy_id", "date", "return", "position"]
+        ).to_parquet(output_dir / "validation_daily_returns.parquet", index=False)
+
+    summary = {
+        "schema_version": "1",
+        "campaign_id": "sp500-autonomous-discovery",
+        "result_status": "EXPLORATORY_VALIDATION_RESULT",
+        "strategy_id": strategy_id,
+        "candidate_status": row["status"],
+        "candidate_rejection_reason": row.get("rejection_reason"),
+        "confirmatory_result": False,
+        "owner_authorized_exploratory": True,
+        "official_validation_reservation_created": False,
+        "validation_start": VALIDATION_START,
+        "validation_end": VALIDATION_END,
+        "validation_opened": True,
+        "validation_used_for_selection": False,
+        "locked_start": LOCKED_START,
+        "locked_opened": False,
+        "train_freeze_sha256": freeze["freeze_sha256"],
+        "code_sha": os.environ.get("GITHUB_SHA", "LOCAL_TEST_ONLY"),
+    }
+    (output_dir / "validation_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (output_dir / "exploratory_candidate.json").write_text(
+        json.dumps(candidate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    shutil.copy2(
+        train_results_dir / "train_selection_freeze.json",
+        output_dir / "train_selection_freeze.json",
+    )
+    (output_dir / "RESULT_STATUS.md").write_text(
+        "# EXPLORATORY_VALIDATION_RESULT\n\n"
+        "Owner-authorized exploratory validation. This is not a confirmatory result "
+        "because the candidate did not pass every frozen train gate. Locked remained "
+        "closed.\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 def run_validation_once(
